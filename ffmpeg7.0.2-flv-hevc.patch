@@ -1,0 +1,147 @@
+diff --git a/libavformat/flv.h b/libavformat/flv.h
+index f710963b92..8a29aa57f1 100644
+--- a/libavformat/flv.h
++++ b/libavformat/flv.h
+@@ -49,6 +49,7 @@
+ 
+ #define FLV_VIDEO_CODECID_MASK    0x0f
+ #define FLV_VIDEO_FRAMETYPE_MASK  0x70
++#define FLV_LEGACY_VIDEO_FRAMETYPE_MASK  0xf0
+ 
+ #define AMF_END_OF_OBJECT         0x09
+ 
+@@ -116,6 +117,7 @@ enum {
+     FLV_CODECID_H264    = 7,
+     FLV_CODECID_REALH263= 8,
+     FLV_CODECID_MPEG4   = 9,
++    FLV_CODECID_HEVC    = 12,
+ };
+ 
+ enum {
+diff --git a/libavformat/flvdec.c b/libavformat/flvdec.c
+index 892371fcd0..c56dac92b6 100644
+--- a/libavformat/flvdec.c
++++ b/libavformat/flvdec.c
+@@ -39,6 +39,7 @@
+ #include "demux.h"
+ #include "internal.h"
+ #include "flv.h"
++#include "hevc.h"
+ 
+ #define VALIDATE_INDEX_TS_THRESH 2500
+ 
+@@ -352,6 +353,8 @@ static int flv_same_video_codec(AVCodecParameters *vpar, uint32_t flv_codecid)
+         return vpar->codec_id == AV_CODEC_ID_VP6A;
+     case FLV_CODECID_H264:
+         return vpar->codec_id == AV_CODEC_ID_H264;
++    case FLV_CODECID_HEVC:
++        return vpar->codec_id == AV_CODEC_ID_HEVC;
+     default:
+         return vpar->codec_tag == flv_codecid;
+     }
+@@ -410,6 +413,10 @@ static int flv_set_video_codec(AVFormatContext *s, AVStream *vstream,
+         par->codec_id = AV_CODEC_ID_H264;
+         vstreami->need_parsing = AVSTREAM_PARSE_HEADERS;
+         break;
++    case FLV_CODECID_HEVC:
++        par->codec_id = AV_CODEC_ID_HEVC;
++        vstreami->need_parsing = AVSTREAM_PARSE_NONE;
++        break;
+     case FLV_CODECID_MPEG4:
+         par->codec_id = AV_CODEC_ID_MPEG4;
+         break;
+@@ -1463,7 +1470,8 @@ retry_duration:
+         }
+ 
+         if (st->codecpar->codec_id == AV_CODEC_ID_H264 || st->codecpar->codec_id == AV_CODEC_ID_MPEG4 ||
+-            (st->codecpar->codec_id == AV_CODEC_ID_HEVC && type == PacketTypeCodedFrames)) {
++            (enhanced_flv && st->codecpar->codec_id == AV_CODEC_ID_HEVC && type == PacketTypeCodedFrames) || 
++            (!enhanced_flv && st->codecpar->codec_id == AV_CODEC_ID_HEVC)) {
+             // sign extension
+             int32_t cts = (avio_rb24(s->pb) + 0xff800000) ^ 0xff800000;
+             pts = av_sat_add64(dts, cts);
+diff --git a/libavformat/flvenc.c b/libavformat/flvenc.c
+index a7d4fa46a2..85526f2134 100644
+--- a/libavformat/flvenc.c
++++ b/libavformat/flvenc.c
+@@ -76,6 +76,7 @@ typedef enum {
+     FLV_ADD_KEYFRAME_INDEX = (1 << 2),
+     FLV_NO_METADATA = (1 << 3),
+     FLV_NO_DURATION_FILESIZE = (1 << 4),
++    FLV_EXTERN_CODEC = (1 << 5),
+ } FLVFlags;
+ 
+ typedef struct FLVFileposition {
+@@ -227,6 +228,13 @@ error:
+     return flags;
+ }
+ 
++static int is_flv_extern_codec_enable(FLVContext* flv) {
++    if ((flv->flags & FLV_EXTERN_CODEC) == FLV_EXTERN_CODEC) {
++        return 1;
++    }
++    return 0;
++}
++
+ static void put_amf_string(AVIOContext *pb, const char *str)
+ {
+     size_t len = strlen(str);
+@@ -494,6 +502,7 @@ static void flv_write_metadata_packet(AVFormatContext *s, AVCodecParameters *par
+     const AVPacketSideData *side_data = NULL;
+ 
+     if (flv->metadata_pkt_written) return;
++    if (is_flv_extern_codec_enable(flv)) return;
+     if (par->codec_id == AV_CODEC_ID_HEVC || par->codec_id == AV_CODEC_ID_AV1 ||
+         par->codec_id == AV_CODEC_ID_VP9) {
+         int flags_size = 5;
+@@ -680,7 +689,11 @@ static void flv_write_codec_header(AVFormatContext* s, AVCodecParameters* par, i
+             }
+             avio_write(pb, par->extradata, par->extradata_size);
+         } else {
+-            if (par->codec_id == AV_CODEC_ID_HEVC) {
++            if (par->codec_id == AV_CODEC_ID_HEVC && is_flv_extern_codec_enable(flv)) {
++                avio_w8(pb, FLV_CODECID_HEVC | FLV_FRAME_KEY); // flags
++                avio_w8(pb, 0); // AVC sequence header
++                avio_wb24(pb, 0); // composition time
++            } else if (par->codec_id == AV_CODEC_ID_HEVC && !is_flv_extern_codec_enable(flv)) {
+                 avio_w8(pb, FLV_IS_EX_HEADER | PacketTypeSequenceStart | FLV_FRAME_KEY); // ExVideoTagHeader mode with PacketTypeSequenceStart
+                 avio_write(pb, "hvc1", 4);
+             } else if (par->codec_id == AV_CODEC_ID_AV1 || par->codec_id == AV_CODEC_ID_VP9) {
+@@ -1004,7 +1017,7 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+     else
+         flags_size = 1;
+ 
+-    if (par->codec_id == AV_CODEC_ID_HEVC && pkt->pts != pkt->dts)
++    if (par->codec_id == AV_CODEC_ID_HEVC && pkt->pts != pkt->dts && !is_flv_extern_codec_enable(flv))
+         flags_size += 3;
+ 
+     if (par->codec_id == AV_CODEC_ID_AAC || par->codec_id == AV_CODEC_ID_H264
+@@ -1142,7 +1155,9 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+         avio_wb32(pb, data_size + 11);
+     } else {
+         av_assert1(flags>=0);
+-        if (par->codec_id == AV_CODEC_ID_HEVC) {
++        if (par->codec_id == AV_CODEC_ID_HEVC && is_flv_extern_codec_enable(flv)) {
++            avio_w8(pb, flags & FLV_LEGACY_VIDEO_FRAMETYPE_MASK | FLV_CODECID_HEVC);
++        } else if (par->codec_id == AV_CODEC_ID_HEVC && !is_flv_extern_codec_enable(flv)) {
+             int pkttype = (pkt->pts != pkt->dts) ? PacketTypeCodedFrames : PacketTypeCodedFramesX;
+             avio_w8(pb, FLV_IS_EX_HEADER | pkttype | frametype); // ExVideoTagHeader mode with PacketTypeCodedFrames(X)
+             avio_write(pb, "hvc1", 4);
+@@ -1164,7 +1179,8 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
+                              (FFALIGN(par->height, 16) - par->height));
+         } else if (par->codec_id == AV_CODEC_ID_AAC)
+             avio_w8(pb, 1); // AAC raw
+-        else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4) {
++        else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4
++            || (par->codec_id == AV_CODEC_ID_HEVC && is_flv_extern_codec_enable(flv))) {
+             avio_w8(pb, 1); // AVC NALU
+             avio_wb24(pb, pkt->pts - pkt->dts);
+         }
+@@ -1242,6 +1258,7 @@ static const AVOption options[] = {
+     { "no_metadata", "disable metadata for FLV", 0, AV_OPT_TYPE_CONST, {.i64 = FLV_NO_METADATA}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "flvflags" },
+     { "no_duration_filesize", "disable duration and filesize zero value metadata for FLV", 0, AV_OPT_TYPE_CONST, {.i64 = FLV_NO_DURATION_FILESIZE}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "flvflags" },
+     { "add_keyframe_index", "Add keyframe index metadata", 0, AV_OPT_TYPE_CONST, {.i64 = FLV_ADD_KEYFRAME_INDEX}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "flvflags" },
++    { "ext_codec", "enable extern codec of hevc", 0, AV_OPT_TYPE_CONST, {.i64 = FLV_EXTERN_CODEC}, INT_MIN, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM, .unit = "flvflags" },
+     { NULL },
+ };
+ 
