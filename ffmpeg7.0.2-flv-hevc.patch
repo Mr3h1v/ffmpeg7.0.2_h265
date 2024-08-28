@@ -1,16 +1,8 @@
 diff --git a/libavformat/flv.h b/libavformat/flv.h
-index f710963b92..8a29aa57f1 100644
+index f710963b92..62297ed54d 100644
 --- a/libavformat/flv.h
 +++ b/libavformat/flv.h
-@@ -49,6 +49,7 @@
- 
- #define FLV_VIDEO_CODECID_MASK    0x0f
- #define FLV_VIDEO_FRAMETYPE_MASK  0x70
-+#define FLV_LEGACY_VIDEO_FRAMETYPE_MASK  0xf0
- 
- #define AMF_END_OF_OBJECT         0x09
- 
-@@ -116,6 +117,7 @@ enum {
+@@ -116,6 +116,7 @@ enum {
      FLV_CODECID_H264    = 7,
      FLV_CODECID_REALH263= 8,
      FLV_CODECID_MPEG4   = 9,
@@ -61,7 +53,7 @@ index 892371fcd0..f62046de5c 100644
              int32_t cts = (avio_rb24(s->pb) + 0xff800000) ^ 0xff800000;
              pts = av_sat_add64(dts, cts);
 diff --git a/libavformat/flvenc.c b/libavformat/flvenc.c
-index a7d4fa46a2..6b66854cc1 100644
+index a7d4fa46a2..429bc84b4e 100644
 --- a/libavformat/flvenc.c
 +++ b/libavformat/flvenc.c
 @@ -76,6 +76,7 @@ typedef enum {
@@ -154,7 +146,7 @@ index a7d4fa46a2..6b66854cc1 100644
          av_assert1(flags>=0);
 -        if (par->codec_id == AV_CODEC_ID_HEVC) {
 +        if (par->codec_id == AV_CODEC_ID_HEVC && is_flv_extern_codec_enable(flv)) {
-+            avio_w8(pb, flags & FLV_LEGACY_VIDEO_FRAMETYPE_MASK | FLV_CODECID_HEVC);
++            avio_w8(pb, frametype | FLV_CODECID_HEVC);
 +        } else if (par->codec_id == AV_CODEC_ID_HEVC && !is_flv_extern_codec_enable(flv)) {
              int pkttype = (pkt->pts != pkt->dts) ? PacketTypeCodedFrames : PacketTypeCodedFramesX;
              avio_w8(pb, FLV_IS_EX_HEADER | pkttype | frametype); // ExVideoTagHeader mode with PacketTypeCodedFrames(X)
